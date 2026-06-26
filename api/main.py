@@ -5,7 +5,7 @@ import json
 import threading
 import numpy as np
 import psutil
-import torch
+import tensorflow as tf
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -111,10 +111,11 @@ def generate_mock_transit(seq_len=2000, has_transit=True, noise_level=0.02):
 
 @app.get("/api/health")
 def health_check():
+    gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
     return {
         "status": "healthy",
-        "gpu_available": torch.cuda.is_available(),
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "gpu_available": gpu_available,
+        "device": "cuda" if gpu_available else "cpu"
     }
 
 @app.get("/api/system-stats")
@@ -123,9 +124,11 @@ def system_stats():
     cpu_usage = psutil.cpu_percent()
     ram_usage = psutil.virtual_memory().percent
     gpu_usage = 0.0
-    if torch.cuda.is_available():
+    if len(tf.config.list_physical_devices('GPU')) > 0:
         try:
-            gpu_usage = torch.cuda.utilization()
+            # Under TensorFlow, we don't have a direct equivalent of torch.cuda.utilization(),
+            # so we report 0.0 or check device existence.
+            gpu_usage = 0.0
         except Exception:
             gpu_usage = 0.0
     return {
@@ -376,30 +379,35 @@ def predict_transit(req: PredictRequest, db: Session = Depends(get_db)):
     noise_val = estimate_noise(raw_flux)
     noise_level = "Low" if noise_val < 0.005 else "Medium" if noise_val < 0.015 else "High"
     
-    # 2. PyTorch model inference
+    # 2. TensorFlow model inference
     model = ExoplanetDetectorNet(input_len=2000)
-    best_model_path = os.path.join('saved_models', 'best_model.pt')
+    model(np.zeros((1, 2000, 1), dtype=np.float32), training=False)
+    best_model_path = os.path.join('saved_models', 'best_model.weights.h5')
     if os.path.exists(best_model_path):
         try:
-            checkpoint = torch.load(best_model_path, map_location=torch.device('cpu'))
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_weights(best_model_path)
+        except Exception:
+            pass
+    elif os.path.exists(os.path.join('saved_models', 'best_model.pt')):
+        # Fallback if checkpoint named .pt was created
+        try:
+            model.load_weights(os.path.join('saved_models', 'best_model.weights.h5'))
         except Exception:
             pass
             
-    model.eval()
-    input_tensor = torch.tensor(padded_flux, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    input_tensor = np.array(padded_flux, dtype=np.float32)[np.newaxis, :, np.newaxis]
     
     # Uncertainty Estimation via MC Dropout
     mean_prob, uncertainty, reliability = estimate_uncertainty_mc_dropout(model, input_tensor, num_samples=10)
     
     # Forward Pass for Attention & GradCAM
     gradcam = GradCAM1D(model, model.res3.conv2)
-    _, attn_map = model(input_tensor)
+    _, attn_map = model(input_tensor, training=False)
     heatmap = gradcam.generate_heatmap(input_tensor)
     
     attn_list = []
     if attn_map is not None:
-        attn_np = attn_map.detach().cpu().numpy()[0]
+        attn_np = attn_map.numpy()[0]
         attn_list = np.mean(attn_np, axis=0).tolist()
     heatmap_list = heatmap.tolist()
     

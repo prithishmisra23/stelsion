@@ -1,6 +1,5 @@
 import numpy as np
-import torch
-import pytest
+import tensorflow as tf
 from preprocessing.filters import handle_missing_values, normalize_flux, remove_outliers_sigma_clipping
 from models.architecture import ExoplanetDetectorNet
 
@@ -22,16 +21,15 @@ def test_sigma_clipping():
 
 def test_model_forward():
     model = ExoplanetDetectorNet(input_len=2000)
-    model.eval()
+    model(np.zeros((1, 2000, 1), dtype=np.float32), training=False)
     
-    # Batch size 2, 1 channel, sequence length 2000
-    dummy_input = torch.randn(2, 1, 2000)
-    with torch.no_grad():
-        out, attn = model(dummy_input)
+    # Batch size 2, sequence length 2000, 1 channel
+    dummy_input = tf.random.normal((2, 2000, 1))
+    out, attn = model(dummy_input, training=False)
         
     assert out.shape == (2, 1)
-    assert out.min() >= 0.0
-    assert out.max() <= 1.0
+    assert np.min(out) >= 0.0
+    assert np.max(out) <= 1.0
     assert attn is not None
 
 def test_noise_estimation_and_adaptive():
@@ -63,7 +61,8 @@ def test_mc_dropout_and_params():
     from evaluation.explainability import estimate_uncertainty_mc_dropout, estimate_transit_parameters
     
     model = ExoplanetDetectorNet(input_len=2000)
-    dummy_input = torch.randn(1, 1, 2000)
+    model(np.zeros((1, 2000, 1), dtype=np.float32), training=False)
+    dummy_input = tf.random.normal((1, 2000, 1))
     
     mean_prob, uncertainty, reliability = estimate_uncertainty_mc_dropout(model, dummy_input, num_samples=5)
     assert 0.0 <= mean_prob <= 1.0
@@ -75,4 +74,3 @@ def test_mc_dropout_and_params():
     params = estimate_transit_parameters(flux)
     assert params["depth_percent"] > 0.0
     assert params["duration_hours"] > 0.0
-

@@ -1,71 +1,115 @@
 import numpy as np
-import torch
-import torch.nn.functional as F
+import tensorflow as tf
+import scipy.signal as signal
 
 class GradCAM1D:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        
-        # Register hooks
-        self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_backward_hook(self.save_gradient)
-
-    def save_activation(self, module, input, output):
-        self.activations = output.detach()
-
-    def save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
 
     def generate_heatmap(self, input_tensor):
-        self.model.eval()
+        activations = []
+        original_call = self.target_layer.call
         
-        # Forward pass
-        output, _ = self.model(input_tensor)
-        
-        # Target the prediction class (binary classification)
-        self.model.zero_grad()
-        output.backward(retain_graph=True)
-        
-        # Pool the gradients across the sequence length
-        pooled_gradients = torch.mean(self.gradients, dim=2) # Shape: [batch, channels]
-        
-        # Weight the channels by the pooled gradients
-        for i in range(self.activations.shape[1]):
-            self.activations[:, i, :] *= pooled_gradients[:, i].unsqueeze(-1)
+        # Temporarily wrap the target layer call to capture its activations
+        def wrapped_call(*args, **kwargs):
+            out = original_call(*args, **kwargs)
+            activations.append(out)
+            return out
             
-        # Sum the channels
-        heatmap = torch.mean(self.activations, dim=1).squeeze(0)
-        heatmap = F.relu(heatmap) # Apply ReLU to target positive contribution
+        self.target_layer.call = wrapped_call
         
-        # Normalize between 0 and 1
-        max_val = torch.max(heatmap)
+        try:
+            # Cast input to tensor and watch it
+            input_tensor = tf.convert_to_tensor(input_tensor, dtype=tf.float32)
+            
+            with tf.GradientTape(persistent=True) as tape:
+                tape.watch(input_tensor)
+                output, _ = self.model(input_tensor, training=False)
+                
+            if not activations:
+                raise ValueError("Target layer was not called during forward pass.")
+                
+            act_tensor = activations[0]
+            # Compute gradients of predictions with respect to target activations
+            grads = tape.gradient(output, act_tensor)
+            
+        finally:
+            # Restore original call
+            self.target_layer.call = original_call
+            
+        # act_tensor shape: [B, N_act, C_act] e.g. [1, 250, 256]
+        # grads shape: [B, N_act, C_act]
+        
+        # Mean gradients across sequence length to get channel weights
+        pooled_gradients = tf.reduce_mean(grads, axis=1) # [B, C_act]
+        
+        # Scale activations by channel weights
+        weighted_activations = act_tensor * tf.expand_dims(pooled_gradients, axis=1)
+        
+        # Average over channels
+        heatmap = tf.reduce_mean(weighted_activations, axis=-1) # [B, N_act]
+        heatmap = tf.squeeze(heatmap, axis=0) # [N_act]
+        
+        # Apply ReLU
+        heatmap = tf.maximum(heatmap, 0.0)
+        
+        # Normalize
+        max_val = float(tf.reduce_max(heatmap).numpy())
         if max_val > 0:
-            heatmap /= max_val
+            heatmap = heatmap / max_val
             
-        return heatmap.cpu().numpy()
+        heatmap_np = heatmap.numpy()
+        
+        # Interpolate heatmap to match input sequence length (2000 points) to avoid plotting shape mismatch
+        target_len = input_tensor.shape[1]
+        if len(heatmap_np) != target_len:
+            heatmap_np = np.interp(
+                np.linspace(0, len(heatmap_np) - 1, target_len),
+                np.arange(len(heatmap_np)),
+                heatmap_np
+            )
+            
+        return heatmap_np
 
 def estimate_uncertainty_mc_dropout(model, input_tensor, num_samples=10):
     """
     Computes exoplanet probability and uncertainty using Monte Carlo Dropout.
+    Forces Keras Dropout layers to run with training=True while keeping Batch Normalization in inference mode.
     """
-    model.train()  # Turn on training mode to keep Dropout active
+    # Cast input to tensor
+    input_tensor = tf.convert_to_tensor(input_tensor, dtype=tf.float32)
     
-    # Make sure other batch norm layers are in eval mode
-    for m in model.modules():
-        if isinstance(m, torch.nn.BatchNorm1d):
-            m.eval()
+    # Locate all Dropout layers in the model (including sub-layers/blocks)
+    dropout_layers = []
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.Dropout):
+            dropout_layers.append(layer)
+        # Check inside ResidualBlock1D
+        if hasattr(layer, 'dropout') and isinstance(layer.dropout, tf.keras.layers.Dropout):
+            dropout_layers.append(layer.dropout)
             
-    samples = []
-    with torch.no_grad():
+    # Temporarily wrap Dropout call methods to force training=True
+    original_calls = []
+    for layer in dropout_layers:
+        original_calls.append((layer, layer.call))
+        def make_forced_call(orig_call):
+            def forced_call(inputs, training=None):
+                return orig_call(inputs, training=True)
+            return forced_call
+        layer.call = make_forced_call(layer.call)
+        
+    try:
+        samples = []
         for _ in range(num_samples):
-            out, _ = model(input_tensor)
-            samples.append(out.item())
+            out, _ = model(input_tensor, training=False)
+            val = float(tf.squeeze(out).numpy())
+            samples.append(val)
+    finally:
+        # Restore original call methods
+        for layer, orig_call in original_calls:
+            layer.call = orig_call
             
-    model.eval()  # Reset back to eval mode
-    
     mean_prob = float(np.mean(samples))
     std_dev = float(np.std(samples))
     # 95% Confidence interval margin
@@ -125,7 +169,7 @@ def estimate_transit_parameters(flux, time=None):
         period_days = float(np.mean(diffs) * 0.005)
     else:
         period_days = 8.23  # Default fallback candidate periodicity if single event
-
+ 
     return {
         "depth_percent": depth_percent,
         "duration_hours": duration_hours,
@@ -205,4 +249,3 @@ def analyze_false_positives(flux, time=None):
         "primary_depth": float(primary_depth),
         "secondary_depth": float(secondary_depth)
     }
-

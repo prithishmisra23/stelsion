@@ -1,67 +1,91 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
+from tensorflow.keras import layers, models
 
-class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, dropout=0.2):
-        super(ResidualBlock1D, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=stride, padding=2, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=5, stride=1, padding=2, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.dropout = nn.Dropout(dropout)
+class ResidualBlock1D(layers.Layer):
+    def __init__(self, in_channels, out_channels, stride=1, dropout=0.2, **kwargs):
+        super(ResidualBlock1D, self).__init__(**kwargs)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.dropout_rate = dropout
+
+    def build(self, input_shape):
+        actual_in_channels = input_shape[-1]
+        self.conv1 = layers.Conv1D(self.out_channels, kernel_size=5, strides=self.stride, padding='same', use_bias=False)
+        self.bn1 = layers.BatchNormalization()
+        self.relu1 = layers.ReLU()
+        self.conv2 = layers.Conv1D(self.out_channels, kernel_size=5, strides=1, padding='same', use_bias=False)
+        self.bn2 = layers.BatchNormalization()
+        self.dropout = layers.Dropout(self.dropout_rate)
+        self.relu2 = layers.ReLU()
         
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
+        if self.stride != 1 or actual_in_channels != self.out_channels:
+            self.shortcut_conv = layers.Conv1D(self.out_channels, kernel_size=1, strides=self.stride, padding='same', use_bias=False)
+            self.shortcut_bn = layers.BatchNormalization()
+            
+        super(ResidualBlock1D, self).build(input_shape)
 
-    def forward(self, x):
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = self.relu(out)
+    def call(self, x, training=None):
+        out = self.conv1(x)
+        out = self.bn1(out, training=training)
+        out = self.relu1(out)
+        out = self.dropout(out, training=training)
+        out = self.conv2(out)
+        out = self.bn2(out, training=training)
+        
+        if hasattr(self, 'shortcut_conv'):
+            shortcut_x = self.shortcut_conv(x)
+            shortcut_x = self.shortcut_bn(shortcut_x, training=training)
+        else:
+            shortcut_x = x
+            
+        out += shortcut_x
+        out = self.relu2(out)
         return out
 
-class SelfAttention1D(nn.Module):
-    def __init__(self, in_channels):
-        super(SelfAttention1D, self).__init__()
-        self.query = nn.Conv1d(in_channels, in_channels // 8, kernel_size=1)
-        self.key = nn.Conv1d(in_channels, in_channels // 8, kernel_size=1)
-        self.value = nn.Conv1d(in_channels, in_channels, kernel_size=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
+class SelfAttention1D(layers.Layer):
+    def __init__(self, in_channels=None, **kwargs):
+        super(SelfAttention1D, self).__init__(**kwargs)
+        self.in_channels = in_channels
 
-    def forward(self, x):
-        # x shape: [batch_size, channels, seq_len]
-        batch_size, channels, seq_len = x.size()
+    def build(self, input_shape):
+        actual_in_channels = input_shape[-1]
+        self.query = layers.Conv1D(actual_in_channels // 8, kernel_size=1)
+        self.key = layers.Conv1D(actual_in_channels // 8, kernel_size=1)
+        self.value = layers.Conv1D(actual_in_channels, kernel_size=1)
+        self.gamma = self.add_weight(
+            name='gamma',
+            shape=(1,),
+            initializer='zeros',
+            trainable=True
+        )
+        super(SelfAttention1D, self).build(input_shape)
+
+    def call(self, x, training=None):
+        # x shape: [batch_size, seq_len, channels]
+        proj_query = self.query(x)  # [B, N, C']
+        proj_key = self.key(x)      # [B, N, C']
         
-        proj_query = self.query(x).view(batch_size, -1, seq_len).permute(0, 2, 1)  # B x N x C'
-        proj_key = self.key(x).view(batch_size, -1, seq_len)  # B x C' x N
+        # energy = proj_query * proj_key^T
+        energy = tf.matmul(proj_query, proj_key, transpose_b=True)  # [B, N, N]
+        attention = tf.nn.softmax(energy, axis=-1)  # [B, N, N]
         
-        energy = torch.bmm(proj_query, proj_key)  # B x N x N
-        attention = F.softmax(energy, dim=-1)  # B x N x N
-        
-        proj_value = self.value(x).view(batch_size, -1, seq_len)  # B x C x N
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))  # B x C x N
-        out = out.view(batch_size, channels, seq_len)
+        proj_value = self.value(x)  # [B, N, C]
+        out = tf.matmul(attention, proj_value)  # [B, N, C]
         
         out = self.gamma * out + x
         return out, attention
 
-class ExoplanetDetectorNet(nn.Module):
-    def __init__(self, input_len=2000, dropout=0.3):
-        super(ExoplanetDetectorNet, self).__init__()
+class ExoplanetDetectorNet(models.Model):
+    def __init__(self, input_len=2000, dropout=0.3, **kwargs):
+        super(ExoplanetDetectorNet, self).__init__(**kwargs)
         self.input_len = input_len
         
-        # Initial 1D CNN Layer
-        self.conv1 = nn.Conv1d(1, 32, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        # Initial 1D CNN Layer (expecting [B, seq_len, 1])
+        self.conv1 = layers.Conv1D(32, kernel_size=7, strides=2, padding='same', use_bias=False)
+        self.bn1 = layers.BatchNormalization()
+        self.relu1 = layers.ReLU()
+        self.maxpool = layers.MaxPool1D(pool_size=3, strides=2, padding='same')
         
         # Residual Blocks
         self.res1 = ResidualBlock1D(32, 64, stride=2, dropout=dropout)
@@ -72,30 +96,32 @@ class ExoplanetDetectorNet(nn.Module):
         self.attention = SelfAttention1D(256)
         
         # Global Average Pooling
-        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.gap = layers.GlobalAveragePooling1D()
         
         # Fully Connected Layers
-        self.fc1 = nn.Linear(256, 64)
-        self.fc2 = nn.Linear(64, 1)
-        self.dropout = nn.Dropout(dropout)
+        self.fc1 = layers.Dense(64, activation='relu')
+        self.dropout = layers.Dropout(dropout)
+        self.fc2 = layers.Dense(1, activation='sigmoid')
         
-    def forward(self, x):
-        # Input shape: [batch_size, seq_len]
+    def call(self, x, training=None):
+        # Input shape: [batch_size, seq_len] or [batch_size, seq_len, 1]
         if len(x.shape) == 2:
-            x = x.unsqueeze(1) # Add channel dimension -> [batch_size, 1, seq_len]
+            x = tf.expand_dims(x, axis=-1) # Add channel dimension -> [batch_size, seq_len, 1]
             
-        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.conv1(x)
+        x = self.bn1(x, training=training)
+        x = self.relu1(x)
         x = self.maxpool(x)
         
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
+        x = self.res1(x, training=training)
+        x = self.res2(x, training=training)
+        x = self.res3(x, training=training)
         
-        x, attn_map = self.attention(x)
+        x, attn_map = self.attention(x, training=training)
         
-        x = self.gap(x).squeeze(-1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = torch.sigmoid(self.fc2(x))
+        x = self.gap(x)
+        x = self.fc1(x)
+        x = self.dropout(x, training=training)
+        x = self.fc2(x)
         
         return x, attn_map

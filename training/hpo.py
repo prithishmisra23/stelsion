@@ -1,5 +1,4 @@
 import optuna
-import torch
 import numpy as np
 from models.architecture import ExoplanetDetectorNet
 from training.train import Trainer

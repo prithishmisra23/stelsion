@@ -1,10 +1,9 @@
 import os
 import sys
 import json
-import torch
+import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
 
 # Ensure current directory is in path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -28,7 +27,7 @@ def build_and_run_pipeline():
     # 1. Generate Synthetic Dataset
     print("\n[Step 1/5] Generating Synthetic Dataset...")
     np.random.seed(42)
-    torch.manual_seed(42)
+    tf.random.set_seed(42)
     
     x_raw = []
     y_raw = []
@@ -149,14 +148,13 @@ def build_and_run_pipeline():
     )
     
     # Load best checkpoint
-    best_model_path = os.path.join('saved_models', 'best_model.pt')
+    best_model_path = os.path.join('saved_models', 'best_model.weights.h5')
     if os.path.exists(best_model_path):
         print(f"Loading best checkpoint model from: {best_model_path}")
         trainer.load_checkpoint(best_model_path)
     
     # 4. Predict on Test Set
     print("\n[Step 4/5] Running Inference on Test Set...")
-    model.eval()
     
     # Header for results
     print("-" * 125)
@@ -173,8 +171,8 @@ def build_and_run_pipeline():
         true_label = int(test_y[idx])
         target_name = f"TestTarget-{idx+1:02d}"
         
-        # Format input tensor [1, 1, 2000]
-        input_tensor = torch.tensor(flux, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(trainer.device)
+        # Format input tensor [1, 2000, 1]
+        input_tensor = np.array(flux, dtype=np.float32)[np.newaxis, :, np.newaxis]
         
         # MC Dropout Uncertainty
         mean_prob, uncertainty, reliability = estimate_uncertainty_mc_dropout(model, input_tensor, num_samples=10)
@@ -207,17 +205,17 @@ def build_and_run_pipeline():
         os.makedirs("results", exist_ok=True)
         
         sample_flux = test_x[sample_to_plot_idx]
-        input_tensor = torch.tensor(sample_flux, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(trainer.device)
+        input_tensor = np.array(sample_flux, dtype=np.float32)[np.newaxis, :, np.newaxis]
         
         # GradCAM
         gradcam = GradCAM1D(model, model.res3.conv2)
         heatmap = gradcam.generate_heatmap(input_tensor)
         
         # Attention
-        _, attn_map = model(input_tensor)
+        _, attn_map = model(input_tensor, training=False)
         attn_list = []
         if attn_map is not None:
-            attn_np = attn_map.detach().cpu().numpy()[0]
+            attn_np = attn_map.numpy()[0]
             attn_list = np.mean(attn_np, axis=0)
             
         # Plot
