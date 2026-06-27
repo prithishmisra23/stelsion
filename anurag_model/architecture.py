@@ -215,10 +215,10 @@ class UpgradedExoplanetDetectorNet(models.Model):
         """
         The SOTA Upgraded Exoplanet Classification Network.
         Integrates:
-        - **InceptionTime Global Branch (2000 pts)**: Inception modules extracting 
-          multi-scale features paired with horizontal/vertical Multi-Axis Attention.
-        - **Local Branch (200 pts)**: Processes transit ingress/egress shape geometry.
-        - **Feature Fusion**: Merges both representation branches for classification.
+        - **InceptionTime Global Branch (2000 pts)**
+        - **Local Branch (200 pts)**
+        - **Centroid Motion Branch (2000 pts x 2 channels X/Y)**
+        - **Stellar Metadata Branch (Dense, 3 tabular features)**
         """
         super(UpgradedExoplanetDetectorNet, self).__init__(**kwargs)
         self.input_len = input_len
@@ -234,20 +234,29 @@ class UpgradedExoplanetDetectorNet(models.Model):
         self.global_relu = layers.ReLU()
         self.global_maxpool = layers.MaxPool1D(pool_size=3, strides=2, padding='same')
         
-        # Stacked Inception Modules replacing basic convolutions
         self.global_inc1 = InceptionModule1D(filters=16, bottleneck_filters=16, stride=2, name="inc_module_1") 
         self.global_inc2 = InceptionModule1D(filters=32, bottleneck_filters=32, stride=1, name="inc_module_2") 
         self.global_inc3 = InceptionModule1D(filters=64, bottleneck_filters=64, stride=1, name="inc_module_3") 
         
-        # Multi-Axis Attention Layer (Horizontal shape + Vertical stability)
         self.global_attention = MultiAxisAttention2D(num_orbits=10, orbit_len=25, num_heads=num_heads)
         self.global_gap = layers.GlobalAveragePooling1D()
         
         # --- LOCAL BRANCH SETUP ---
         self.local_branch = LocalFeatureExtractor1D(dropout=dropout)
         
+        # --- CENTROID BRANCH SETUP (X/Y Motion) ---
+        self.centroid_conv1 = layers.Conv1D(16, kernel_size=9, strides=2, padding='same', activation='relu')
+        self.centroid_pool = layers.MaxPool1D(pool_size=3, strides=2, padding='same')
+        self.centroid_conv2 = layers.Conv1D(32, kernel_size=5, strides=2, padding='same', activation='relu')
+        self.centroid_gap = layers.GlobalAveragePooling1D()
+
+        # --- STELLAR METADATA BRANCH SETUP ---
+        self.meta_dense1 = layers.Dense(16, activation='relu')
+        self.meta_dense2 = layers.Dense(16, activation='relu')
+
         # --- CLASSIFICATION HEAD ---
-        self.fc1 = layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        # Fused features: Global(256) + Local(128) + Centroid(32) + Meta(16) = 432
+        self.fc1 = layers.Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.dropout_layer = layers.Dropout(dropout)
         self.fc2 = layers.Dense(1, activation='sigmoid', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         
@@ -288,8 +297,10 @@ class UpgradedExoplanetDetectorNet(models.Model):
         if isinstance(inputs, dict):
             global_x = inputs['global']
             local_x = inputs['local']
+            centroid_x = inputs.get('centroid', None)
+            meta_x = inputs.get('metadata', None)
         else:
-            global_x, local_x = inputs
+            global_x, local_x, centroid_x, meta_x = inputs
             
         if len(global_x.shape) == 2:
             global_x = tf.expand_dims(global_x, axis=-1)
@@ -307,13 +318,31 @@ class UpgradedExoplanetDetectorNet(models.Model):
         g = self.global_inc3(g, training=training)
         
         g, attn_map = self.global_attention(g, training=training)
-        global_feats = self.global_gap(g) # [Batch, 256]
+        global_feats = self.global_gap(g)
         
         # 2. Local View Branch
-        local_feats = self.local_branch(local_x, training=training) # [Batch, 128]
+        local_feats = self.local_branch(local_x, training=training)
         
-        # 3. Feature Fusion & Classification
-        fused = tf.concat([global_feats, local_feats], axis=-1) # [Batch, 384]
+        # 3. Centroid Branch (Handle optional for backward compat)
+        if centroid_x is not None:
+            c = self.centroid_conv1(centroid_x)
+            c = self.centroid_pool(c)
+            c = self.centroid_conv2(c)
+            centroid_feats = self.centroid_gap(c)
+        else:
+            batch_size = tf.shape(global_x)[0]
+            centroid_feats = tf.zeros((batch_size, 32))
+            
+        # 4. Metadata Branch
+        if meta_x is not None:
+            m = self.meta_dense1(meta_x)
+            meta_feats = self.meta_dense2(m)
+        else:
+            batch_size = tf.shape(global_x)[0]
+            meta_feats = tf.zeros((batch_size, 16))
+            
+        # 5. Feature Fusion & Classification
+        fused = tf.concat([global_feats, local_feats, centroid_feats, meta_feats], axis=-1)
         
         x = self.fc1(fused)
         x = self.dropout_layer(x, training=training)

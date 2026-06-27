@@ -2,49 +2,46 @@ import os
 import sys
 import numpy as np
 import tensorflow as tf
+import batman
 
 # Ensure parent directory is in path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from anurag_model.pipeline import DualViewPipeline
 
-def generate_trapezoidal_transit(length, period, depth, duration, t0):
+def generate_mandel_agol_transit(length, period, rp, t0):
     """
-    Generates a physically motivated trapezoidal transit dip profile.
-    Uses periodic folding to support multiple transit events in a single curve.
+    Generates a high-fidelity Mandel & Agol (2002) limb-darkened transit profile
+    using the batman-package.
+    rp: planet-to-star radius ratio
     """
-    time = np.arange(length)
-    profile = np.zeros(length, dtype=np.float32)
+    time = np.linspace(0, 10, length)
     
-    # Calculate phase [0.0, 1.0]
-    phase = ((time - t0) / period) % 1.0
+    params = batman.TransitParams()
+    params.t0 = (t0 / length) * 10.0  # time of inferior conjunction
+    params.per = (period / length) * 10.0 # orbital period
+    params.rp = rp                      # planet radius (in units of stellar radii)
+    params.a = 15.                      # semi-major axis (in units of stellar radii)
+    params.inc = 89.5                   # orbital inclination (in degrees)
+    params.ecc = 0.                     # eccentricity
+    params.w = 90.                      # longitude of periastron (in degrees)
+    params.u = [0.1, 0.3]               # limb darkening coefficients
+    params.limb_dark = "quadratic"      # limb darkening model
     
-    # Calculate index distance to the nearest periodic transit center
-    dist = np.minimum(phase, 1.0 - phase) * period
+    m = batman.TransitModel(params, time)
+    flux = m.light_curve(params)
     
-    # Ingress/egress slope width (10% of total duration)
-    ingress = duration * 0.1
-    half_dur = duration / 2.0
-    
-    t_start = half_dur - ingress / 2.0
-    t_end = half_dur + ingress / 2.0
-    
-    # Core flat bottom of transit
-    flat_mask = dist <= t_start
-    profile[flat_mask] = -depth
-    
-    # Ingress/egress slopes
-    slope_mask = (dist > t_start) & (dist < t_end)
-    if ingress > 0 and np.any(slope_mask):
-        profile[slope_mask] = -depth * (t_end - dist[slope_mask]) / ingress
-        
-    return profile
+    # Batman generates 1.0 for out of transit, and < 1.0 for in-transit. 
+    # We want a dip profile that is 0 for out of transit and < 0 for in-transit.
+    return flux - 1.0
 
 class ExoplanetDataset(tf.keras.utils.Sequence):
     def __init__(self, num_samples=160, batch_size=16, length=2000, inject_prob=0.5, **kwargs):
         """
-        Keras Sequence Dataset that generates stellar noise baselines and dynamically 
-        injects physical planet transit dips on the fly.
+        SOTA Keras Sequence Dataset with:
+        1. Mandel-Agol Limb-Darkened Transits.
+        2. Centroid Motion Simulation (X/Y) to simulate eclipsing binaries.
+        3. Tabular Stellar Metadata (Radius, Mass, Teff).
         """
         super(ExoplanetDataset, self).__init__(**kwargs)
         self.num_samples = num_samples
@@ -53,10 +50,8 @@ class ExoplanetDataset(tf.keras.utils.Sequence):
         self.inject_prob = inject_prob
         self.pipeline = DualViewPipeline()
         
-        # Pre-generate different stellar baselines (to avoid pure uniform noise)
         self.baselines = []
         for _ in range(num_samples):
-            # Rotational Modulation (spots rotating) with randomized amplitudes/periods per star
             time = np.linspace(0, 10, length)
             p1 = np.random.uniform(2.0, 5.0)
             p2 = np.random.uniform(0.3, 1.0)
@@ -64,18 +59,14 @@ class ExoplanetDataset(tf.keras.utils.Sequence):
             amp2 = np.random.uniform(0.002, 0.008)
             stellar_var = amp1 * np.sin(2 * np.pi * time / p1) + amp2 * np.cos(2 * np.pi * time / p2)
             
-            # Pointing Jitter / Sensitivity jumps (Thruster firing)
             jitter = np.zeros(length)
-            if np.random.random() < 0.3: # 30% chance of a pointing jump
+            if np.random.random() < 0.3:
                 jump_idx = np.random.randint(200, length - 200)
-                jump_val = np.random.uniform(-0.006, 0.006)
-                jitter[jump_idx:] += jump_val
+                jitter[jump_idx:] += np.random.uniform(-0.006, 0.006)
                 
-            # Stellar Flares (rapid Gaussian spikes)
             flares = np.zeros(length)
-            if np.random.random() < 0.2: # 20% chance of a stellar flare
-                num_flares = np.random.randint(1, 3)
-                for _ in range(num_flares):
+            if np.random.random() < 0.2:
+                for _ in range(np.random.randint(1, 3)):
                     flare_idx = np.random.randint(100, length - 100)
                     flare_amp = np.random.uniform(0.01, 0.03)
                     width = np.random.uniform(2, 6)
@@ -88,54 +79,83 @@ class ExoplanetDataset(tf.keras.utils.Sequence):
         return int(np.ceil(self.num_samples / self.batch_size))
 
     def __getitem__(self, idx):
-        # Calculate start and end indices for this batch
         start_idx = idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.num_samples)
-        current_batch_size = end_idx - start_idx
         
         global_batch = []
         local_batch = []
+        centroid_batch = []
+        meta_batch = []
         label_batch = []
         
         for i in range(start_idx, end_idx):
-            # 1. Start with raw stellar noise baseline
             flux = self.baselines[i].copy()
+            centroid_x = np.random.normal(0, 0.001, self.length)
+            centroid_y = np.random.normal(0, 0.001, self.length)
             
-            # 2. Decide if we inject a planet transit
+            # Metadata: Radius (R_sun), Mass (M_sun), Teff (K / 1000)
+            r_star = np.random.uniform(0.1, 2.0)
+            m_star = np.random.uniform(0.1, 2.0)
+            teff = np.random.uniform(3.0, 7.0)
+            metadata = [r_star, m_star, teff]
+            
             label = 0.0
-            if np.random.random() < self.inject_prob:
-                label = 1.0
+            is_planet = False
+            is_beb = False # Background Eclipsing Binary (False Positive)
+            
+            rand_val = np.random.random()
+            if rand_val < self.inject_prob:
+                # Decide if it's a true planet or a false positive (BEB)
+                if np.random.random() < 0.7:
+                    is_planet = True
+                    label = 1.0
+                else:
+                    is_beb = True
+                    label = 0.0
                 
-                # Randomized transit parameters
-                period = np.random.uniform(300, 600)   # Period in index units
-                depth = np.random.uniform(0.015, 0.04) # 1.5% to 4% transit depth
-                duration = np.random.uniform(30, 80)   # Transit duration in indices
-                t0 = np.random.uniform(50, 250)        # Transit epoch offset
+                period = np.random.uniform(300, 600)
+                rp = np.random.uniform(0.05, 0.2) # Planet radius ratio
+                t0 = np.random.uniform(50, 250)
                 
-                # Generate and apply transit profile
-                transit_dip = generate_trapezoidal_transit(self.length, period, depth, duration, t0)
+                transit_dip = generate_mandel_agol_transit(self.length, period, rp, t0)
                 flux += transit_dip
                 
-            # 3. Add dynamic measurement white noise (Data Augmentation)
+                # If it's a BEB, shift the centroid precisely during the transit!
+                if is_beb:
+                    dip_mask = transit_dip < -0.001
+                    centroid_shift_x = np.random.uniform(0.01, 0.05)
+                    centroid_shift_y = np.random.uniform(0.01, 0.05)
+                    centroid_x[dip_mask] += centroid_shift_x
+                    centroid_y[dip_mask] += centroid_shift_y
+                
             flux += np.random.normal(0, 0.001, self.length)
             
-            # 4. Process through the DualViewPipeline to extract Global/Local views
             global_view, local_view, _, _ = self.pipeline.process(flux)
+            centroid_combined = np.stack([centroid_x, centroid_y], axis=-1)
             
-            # Append to lists with added channel dimension [SeqLen, 1]
             global_batch.append(global_view[:, np.newaxis])
             local_batch.append(local_view[:, np.newaxis])
+            centroid_batch.append(centroid_combined)
+            meta_batch.append(metadata)
             label_batch.append([label])
             
-        return (np.array(global_batch, dtype=np.float32), np.array(local_batch, dtype=np.float32)), np.array(label_batch, dtype=np.float32)
+        inputs_dict = {
+            'global': np.array(global_batch, dtype=np.float32),
+            'local': np.array(local_batch, dtype=np.float32),
+            'centroid': np.array(centroid_batch, dtype=np.float32),
+            'metadata': np.array(meta_batch, dtype=np.float32)
+        }
+        
+        return inputs_dict, np.array(label_batch, dtype=np.float32)
 
 if __name__ == "__main__":
-    print("Testing ExoplanetDataset and Transit Injections in TensorFlow...")
+    print("Testing SOTA ExoplanetDataset...")
     dataset = ExoplanetDataset(num_samples=10, batch_size=2, inject_prob=0.5)
     inputs, y = dataset[0]
-    g_batch, l_batch = inputs
     print(f"Dataset batch test:")
-    print(f"Global View Batch shape: {g_batch.shape} (Expected: (2, 2000, 1))")
-    print(f"Local View Batch shape: {l_batch.shape} (Expected: (2, 200, 1))")
-    print(f"Label Batch shape: {y.shape} (Expected: (2, 1))")
+    print(f"Global View Batch shape: {inputs['global'].shape}")
+    print(f"Local View Batch shape: {inputs['local'].shape}")
+    print(f"Centroid Batch shape: {inputs['centroid'].shape}")
+    print(f"Metadata Batch shape: {inputs['metadata'].shape}")
+    print(f"Label Batch shape: {y.shape}")
     print("\n✓ Dataset test passed successfully!")
