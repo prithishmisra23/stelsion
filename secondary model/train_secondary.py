@@ -15,7 +15,7 @@ def download_and_prepare_kepler_data():
     print("\n[Step 1] Loading Original Kepler Data via Lightkurve...")
     
     exoplanet_targets = ["Kepler-90", "Kepler-11", "Kepler-22", "Kepler-62", "Kepler-186"]
-    quiet_targets = ["KIC 8462852", "KIC 10264738", "KIC 11250927", "KIC 11253772", "KIC 11253828"]
+    quiet_targets = ["KIC 8462852", "KIC 11253772", "KIC 3733346", "KIC 11152511", "KIC 12158940"]
     
     x_raw = []
     y_raw = []
@@ -101,7 +101,7 @@ def train_and_evaluate():
         'sg_polyorder': 2,
         'median_kernel': 5,
         'stellar_var_window': 101,
-        'segment_length': 7200, # target length of 7200 to reshape to 9x800
+        'segment_length': 2000, # target length of 2000 to reshape to 50x40
         'enable_augmentation': True, # Enable augmentation to reduce overfitting
         'test_size': 0.25,
         'val_size': 0.15,
@@ -113,19 +113,19 @@ def train_and_evaluate():
     val_x, val_y = split_data['val']
     test_x, test_y = split_data['test']
     
-    # Reshape input to 2D (9, 800, 1)
-    train_x_reshaped = train_x.reshape(-1, 9, 800, 1)
-    val_x_reshaped = val_x.reshape(-1, 9, 800, 1)
-    test_x_reshaped = test_x.reshape(-1, 9, 800, 1)
+    # Reshape input to 2D (50, 40, 1)
+    train_x_reshaped = train_x.reshape(-1, 50, 40, 1)
+    val_x_reshaped = val_x.reshape(-1, 50, 40, 1)
+    test_x_reshaped = test_x.reshape(-1, 50, 40, 1)
     
-    print(f"Data shapes after reshaping to (9, 800, 1):")
+    print(f"Data shapes after reshaping to (50, 40, 1):")
     print(f" - Train: {train_x_reshaped.shape}")
     print(f" - Validation: {val_x_reshaped.shape}")
     print(f" - Test: {test_x_reshaped.shape}")
     
     # 3. Instantiate and compile secondary model
     print("\n[Step 3] Compiling Regularized Secondary Conv2D Model...")
-    model = build_secondary_model(input_shape=(9, 800, 1), l2_reg=1e-3, dropout_rate_fc1=0.5, dropout_rate_fc2=0.3)
+    model = build_secondary_model(input_shape=(50, 40, 1), l2_reg=1e-3, dropout_rate_fc1=0.5, dropout_rate_fc2=0.3)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss=tf.keras.losses.BinaryCrossentropy(),
@@ -174,5 +174,19 @@ def train_and_evaluate():
     print(f"Test Loss:       {test_loss:.4f} | Test Accuracy:       {test_acc*100:.2f}%")
     print("=" * 70)
 
+    # 6. Save the trained secondary model
+    print("\n[Step 6] Saving Trained Secondary Model...")
+    save_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'saved_models'))
+    os.makedirs(save_dir, exist_ok=True)
+    
+    weights_path = os.path.join(save_dir, 'secondary_model.weights.h5')
+    model.save_weights(weights_path)
+    print(f"Saved weights to: {weights_path}")
+    
+    model_path = os.path.join(save_dir, 'secondary_model.h5')
+    model.save(model_path)
+    print(f"Saved full model to: {model_path}")
+
 if __name__ == '__main__':
     train_and_evaluate()
+
