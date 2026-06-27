@@ -1,151 +1,153 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-class DilatedResidualBlock1D(layers.Layer):
-    def __init__(self, in_channels, out_channels, stride=1, dilation=1, dropout=0.2, **kwargs):
+class InceptionModule1D(layers.Layer):
+    def __init__(self, filters, bottleneck_filters=16, stride=1, **kwargs):
         """
-        An upgraded 1D residual block using dilated convolutions to expand the 
-        receptive field without losing sequence resolution.
+        InceptionTime Block for 1D time series.
+        Applies parallel convolutions of different scale lengths (k=9, 19, 39)
+        to capture both short and long duration exoplanet transit phases.
         """
-        super(DilatedResidualBlock1D, self).__init__(**kwargs)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        super(InceptionModule1D, self).__init__(**kwargs)
+        self.filters = filters
+        self.bottleneck_filters = bottleneck_filters
         self.stride = stride
-        self.dilation = dilation
-        self.dropout_rate = dropout
 
     def build(self, input_shape):
         actual_in_channels = input_shape[-1]
         
-        # First convolution: standard kernel, handles downsampling if stride > 1
-        self.conv1 = layers.Conv1D(
-            self.out_channels, kernel_size=5, strides=self.stride, 
-            padding='same', use_bias=False
+        # Bottleneck convolution to compress features
+        self.bottleneck = layers.Conv1D(
+            self.bottleneck_filters, kernel_size=1, padding='same', use_bias=False
         )
-        self.bn1 = layers.BatchNormalization()
-        self.relu1 = layers.ReLU()
         
-        # Second convolution: Dilated convolution
-        self.conv2 = layers.Conv1D(
-            self.out_channels, kernel_size=5, strides=1, 
-            dilation_rate=self.dilation, padding='same', use_bias=False
+        # Parallel multi-scale convolutions
+        self.conv_small = layers.Conv1D(
+            self.filters, kernel_size=9, strides=self.stride, padding='same', use_bias=False
         )
-        self.bn2 = layers.BatchNormalization()
-        self.dropout = layers.Dropout(self.dropout_rate)
-        self.relu2 = layers.ReLU()
+        self.conv_medium = layers.Conv1D(
+            self.filters, kernel_size=19, strides=self.stride, padding='same', use_bias=False
+        )
+        self.conv_large = layers.Conv1D(
+            self.filters, kernel_size=39, strides=self.stride, padding='same', use_bias=False
+        )
         
-        # Shortcut mapping if dimensions mismatch
-        if self.stride != 1 or actual_in_channels != self.out_channels:
+        # Max pooling branch
+        self.maxpool = layers.MaxPool1D(pool_size=3, strides=self.stride, padding='same')
+        self.conv_pool = layers.Conv1D(self.filters, kernel_size=1, padding='same', use_bias=False)
+        
+        self.bn = layers.BatchNormalization()
+        self.relu = layers.ReLU()
+        
+        # Shortcut connection for residual learning
+        self.out_channels = 4 * self.filters
+        if actual_in_channels != self.out_channels or self.stride != 1:
             self.shortcut_conv = layers.Conv1D(
-                self.out_channels, kernel_size=1, strides=self.stride, 
-                padding='same', use_bias=False
+                self.out_channels, kernel_size=1, strides=self.stride, padding='same', use_bias=False
             )
             self.shortcut_bn = layers.BatchNormalization()
             
-        super(DilatedResidualBlock1D, self).build(input_shape)
+        super(InceptionModule1D, self).build(input_shape)
 
     def call(self, x, training=None):
-        out = self.conv1(x)
-        out = self.bn1(out, training=training)
-        out = self.relu1(out)
-        out = self.dropout(out, training=training)
-        out = self.conv2(out)
-        out = self.bn2(out, training=training)
+        bottleneck_x = self.bottleneck(x)
+        
+        out_small = self.conv_small(bottleneck_x)
+        out_medium = self.conv_medium(bottleneck_x)
+        out_large = self.conv_large(bottleneck_x)
+        
+        out_pool = self.conv_pool(self.maxpool(x))
+        
+        # Concatenate parallel branches
+        out = tf.concat([out_small, out_medium, out_large, out_pool], axis=-1)
+        out = self.bn(out, training=training)
         
         if hasattr(self, 'shortcut_conv'):
             shortcut_x = self.shortcut_conv(x)
-            shortcut_x = self.shortcut_bn(shortcut_x, training=training)
+            if hasattr(self, 'shortcut_bn'):
+                shortcut_x = self.shortcut_bn(shortcut_x, training=training)
         else:
             shortcut_x = x
             
         out += shortcut_x
-        out = self.relu2(out)
-        return out
+        return self.relu(out)
 
-class MultiHeadSelfAttention1D(layers.Layer):
-    def __init__(self, in_channels, num_heads=4, **kwargs):
+class MultiAxisAttention2D(layers.Layer):
+    def __init__(self, num_orbits=10, orbit_len=25, num_heads=4, **kwargs):
         """
-        An upgraded Multi-Head Self-Attention layer for 1D temporal sequences.
-        Splits channels into separate heads to capture multiple different periodicities
-        and stellar patterns simultaneously.
+        Multi-Axis Self-Attention Layer.
+        Folds the 1D curve into a 2D matrix [Orbits, Phase Steps] to perform:
+        - Major-Axis Attention: Checks transit dip shapes along the horizontal phase.
+        - Minor-Axis Attention: Checks orbit-to-orbit transit stability along the vertical orbits.
         """
-        super(MultiHeadSelfAttention1D, self).__init__(**kwargs)
-        self.in_channels = in_channels
+        super(MultiAxisAttention2D, self).__init__(**kwargs)
+        self.num_orbits = num_orbits
+        self.orbit_len = orbit_len
         self.num_heads = num_heads
 
     def build(self, input_shape):
-        actual_in_channels = input_shape[-1]
-        self.head_dim = actual_in_channels // self.num_heads
+        in_channels = input_shape[-1]
         
-        assert self.head_dim * self.num_heads == actual_in_channels, "in_channels must be divisible by num_heads"
+        # Self-Attention modules for both axes
+        self.major_attn = layers.MultiHeadAttention(num_heads=self.num_heads, key_dim=in_channels // self.num_heads)
+        self.minor_attn = layers.MultiHeadAttention(num_heads=self.num_heads, key_dim=in_channels // self.num_heads)
         
-        # Query, Key, and Value projections using 1x1 convolutions
-        self.q_proj = layers.Conv1D(actual_in_channels, kernel_size=1)
-        self.k_proj = layers.Conv1D(actual_in_channels, kernel_size=1)
-        self.v_proj = layers.Conv1D(actual_in_channels, kernel_size=1)
+        self.major_bn = layers.BatchNormalization()
+        self.minor_bn = layers.BatchNormalization()
         
-        # Final output mixing projection
-        self.out_proj = layers.Conv1D(actual_in_channels, kernel_size=1)
+        # Down-projection convolution to restore feature dimension
+        self.project = layers.Conv1D(in_channels, kernel_size=1, use_bias=False)
+        self.bn_out = layers.BatchNormalization()
         
-        # Learnable gating parameter initialized to 0
-        self.gamma = self.add_weight(
-            name='gamma',
-            shape=(1,),
-            initializer='zeros',
-            trainable=True
-        )
-        super(MultiHeadSelfAttention1D, self).build(input_shape)
+        super(MultiAxisAttention2D, self).build(input_shape)
 
     def call(self, x, training=None):
-        # Input shape: [Batch, SeqLen, Channels]
         batch_size = tf.shape(x)[0]
-        seq_len = tf.shape(x)[1]
+        channels = x.shape[-1]
         
-        # 1. Project Query, Key, Value -> [B, L, C]
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # 1. Fold 1D sequence to 2D Grid: [Batch, 10, 25, Channels]
+        grid = tf.reshape(x, (batch_size, self.num_orbits, self.orbit_len, channels))
         
-        # 2. Reshape to multi-head shape: [B, L, H, D]
-        q = tf.reshape(q, (batch_size, seq_len, self.num_heads, self.head_dim))
-        k = tf.reshape(k, (batch_size, seq_len, self.num_heads, self.head_dim))
-        v = tf.reshape(v, (batch_size, seq_len, self.num_heads, self.head_dim))
+        # 2. Major-Axis Attention (Horizontal - checks transit shapes)
+        # Collapse orbits into batch: [Batch * 10, 25, Channels]
+        major_in = tf.reshape(grid, (batch_size * self.num_orbits, self.orbit_len, channels))
+        major_out = self.major_attn(major_in, major_in, training=training)
+        major_out = self.major_bn(major_out, training=training)
+        major_grid = tf.reshape(major_out, (batch_size, self.num_orbits, self.orbit_len, channels))
         
-        # 3. Transpose for matrix multiplication:
-        # q -> [B, H, L, D]
-        # k -> [B, H, D, L]
-        # v -> [B, H, L, D]
-        q = tf.transpose(q, perm=[0, 2, 1, 3])
-        k = tf.transpose(k, perm=[0, 2, 3, 1])
-        v = tf.transpose(v, perm=[0, 2, 1, 3])
+        # 3. Minor-Axis Attention (Vertical - checks orbit-to-orbit stability)
+        # Transpose to [Batch, 25, 10, Channels] and collapse phase into batch: [Batch * 25, 10, Channels]
+        grid_trans = tf.transpose(grid, perm=[0, 2, 1, 3])
+        minor_in = tf.reshape(grid_trans, (batch_size * self.orbit_len, self.num_orbits, channels))
+        minor_out = self.minor_attn(minor_in, minor_in, training=training)
+        minor_out = self.minor_bn(minor_out, training=training)
+        minor_grid = tf.reshape(minor_out, (batch_size, self.orbit_len, self.num_orbits, channels))
+        # Transpose back to [Batch, 10, 25, Channels]
+        minor_grid = tf.transpose(minor_grid, perm=[0, 2, 1, 3])
         
-        # 4. Calculate Scaled Dot-Product Attention
-        # energy shape: [B, H, L, L]
-        energy = tf.matmul(q, k) / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
-        attention = tf.nn.softmax(energy, axis=-1)
+        # 4. Feature Fusion & Reshaping
+        # Concatenate branches and project to original dimension
+        combined = tf.concat([major_grid, minor_grid], axis=-1)
+        out_2d = tf.reshape(combined, (batch_size, self.num_orbits * self.orbit_len, 2 * channels))
+        out = self.project(out_2d)
+        out = self.bn_out(out, training=training)
+        out = tf.nn.relu(out + x) # Residual connection
         
-        # 5. Multiply attention weights with Value -> [B, H, L, D]
-        out = tf.matmul(attention, v)
+        # Compute a self-similarity correlation matrix for Grad-CAM mapping
+        norm_out = tf.nn.l2_normalize(out, axis=-1)
+        sim_matrix = tf.matmul(norm_out, norm_out, transpose_b=True) # [B, 250, 250]
         
-        # 6. Concatenate heads and project output
-        # [B, H, L, D] -> transpose to [B, L, H, D] -> view as [B, L, C]
-        out = tf.transpose(out, perm=[0, 2, 1, 3])
-        out = tf.reshape(out, (batch_size, seq_len, self.in_channels))
-        out = self.out_proj(out)
-        
-        # 7. Apply residual connection gated by gamma
-        out = self.gamma * out + x
-        
-        # Average attention maps across heads for Grad-CAM/visualization -> [B, L, L]
-        mean_attention = tf.reduce_mean(attention, axis=1)
+        # Resize to exactly 63x63 using average pooling to keep API outputs compatible
+        sim_matrix_expanded = tf.expand_dims(sim_matrix, axis=-1) # [B, 250, 250, 1]
+        sim_matrix_resized = tf.image.resize(sim_matrix_expanded, [63, 63], method='bilinear')
+        mean_attention = tf.squeeze(sim_matrix_resized, axis=-1) # [B, 63, 63]
         
         return out, mean_attention
 
 class LocalFeatureExtractor1D(layers.Layer):
     def __init__(self, dropout=0.2, **kwargs):
         """
-        Extracts high-resolution features from the zoomed-in local folded transit view.
-        Since sequence length is small (200 points), a compact CNN layout is used.
+        Extracts features from the local zoomed transit profile (200 points).
         """
         super(LocalFeatureExtractor1D, self).__init__(**kwargs)
         self.dropout_rate = dropout
@@ -170,7 +172,6 @@ class LocalFeatureExtractor1D(layers.Layer):
         super(LocalFeatureExtractor1D, self).build(input_shape)
 
     def call(self, x, training=None):
-        # x shape: [B, 200, 1]
         x = self.conv1(x)
         x = self.bn1(x, training=training)
         x = self.relu1(x)
@@ -186,19 +187,18 @@ class LocalFeatureExtractor1D(layers.Layer):
         x = self.relu3(x)
         x = self.drop3(x, training=training)
         
-        x = self.gap(x) # [B, 128]
+        x = self.gap(x)
         return x
 
 class UpgradedExoplanetDetectorNet(models.Model):
     def __init__(self, input_len=2000, dropout=0.3, num_heads=4, **kwargs):
         """
-        The SOTA Upgraded Exoplanet Classification Network (Phase 2 Multi-Input in TF).
+        The SOTA Upgraded Exoplanet Classification Network.
         Integrates:
-        - **Global View Branch (2000 pts)**: Processes the folded full orbit through
-          Dilated Convolutions and Multi-Head Self-Attention.
-        - **Local View Branch (200 pts)**: Processes the zoomed-in primary transit
-          dip shape to check ingress/egress transit geometry.
-        - **Feature Fusion**: Concatenates both representations for final classification.
+        - **InceptionTime Global Branch (2000 pts)**: Inception modules extracting 
+          multi-scale features paired with horizontal/vertical Multi-Axis Attention.
+        - **Local Branch (200 pts)**: Processes transit ingress/egress shape geometry.
+        - **Feature Fusion**: Merges both representation branches for classification.
         """
         super(UpgradedExoplanetDetectorNet, self).__init__(**kwargs)
         self.input_len = input_len
@@ -211,18 +211,20 @@ class UpgradedExoplanetDetectorNet(models.Model):
         self.global_relu = layers.ReLU()
         self.global_maxpool = layers.MaxPool1D(pool_size=3, strides=2, padding='same')
         
-        self.global_res1 = DilatedResidualBlock1D(32, 64, stride=2, dilation=1, dropout=dropout)
-        self.global_res2 = DilatedResidualBlock1D(64, 128, stride=2, dilation=2, dropout=dropout)
-        self.global_res3 = DilatedResidualBlock1D(128, 256, stride=2, dilation=4, dropout=dropout)
+        # Stacked Inception Modules replacing basic convolutions
+        # Length progression: 2000 -> 1000 -> 500 (Initial) -> 250 (inc1: stride=2) -> 250 (inc2: stride=1) -> 250 (inc3: stride=1)
+        self.global_inc1 = InceptionModule1D(filters=16, bottleneck_filters=16, stride=2, name="inc_module_1") # Output: 64 channels (4*16)
+        self.global_inc2 = InceptionModule1D(filters=32, bottleneck_filters=32, stride=1, name="inc_module_2") # Output: 128 channels (4*32)
+        self.global_inc3 = InceptionModule1D(filters=64, bottleneck_filters=64, stride=1, name="inc_module_3") # Output: 256 channels (4*64)
         
-        self.global_attention = MultiHeadSelfAttention1D(256, num_heads=num_heads)
+        # Multi-Axis Attention Layer (Horizontal shape + Vertical stability)
+        self.global_attention = MultiAxisAttention2D(num_orbits=10, orbit_len=25, num_heads=num_heads)
         self.global_gap = layers.GlobalAveragePooling1D()
         
         # --- LOCAL BRANCH SETUP ---
         self.local_branch = LocalFeatureExtractor1D(dropout=dropout)
         
         # --- CLASSIFICATION HEAD ---
-        # Combines Global (256 features) and Local (128 features) branches
         self.fc1 = layers.Dense(64, activation='relu')
         self.dropout_layer = layers.Dropout(dropout)
         self.fc2 = layers.Dense(1, activation='sigmoid')
@@ -261,17 +263,12 @@ class UpgradedExoplanetDetectorNet(models.Model):
         return {"loss": self.loss_metric.result(), "accuracy": self.acc_metric.result()}
 
     def call(self, inputs, training=None):
-        """
-        Processes dual inputs: global_x [Batch, 2000, 1] and local_x [Batch, 200, 1].
-        Accepts inputs either as a list/tuple of two tensors or a single dict.
-        """
         if isinstance(inputs, dict):
             global_x = inputs['global']
             local_x = inputs['local']
         else:
             global_x, local_x = inputs
             
-        # Ensure channel dimensions are present [Batch, SeqLen, 1]
         if len(global_x.shape) == 2:
             global_x = tf.expand_dims(global_x, axis=-1)
         if len(local_x.shape) == 2:
@@ -282,9 +279,11 @@ class UpgradedExoplanetDetectorNet(models.Model):
         g = self.global_bn(g, training=training)
         g = self.global_relu(g)
         g = self.global_maxpool(g)
-        g = self.global_res1(g, training=training)
-        g = self.global_res2(g, training=training)
-        g = self.global_res3(g, training=training)
+        
+        g = self.global_inc1(g, training=training)
+        g = self.global_inc2(g, training=training)
+        g = self.global_inc3(g, training=training)
+        
         g, attn_map = self.global_attention(g, training=training)
         global_feats = self.global_gap(g) # [Batch, 256]
         
